@@ -1,26 +1,70 @@
 @import "tailwindcss";
+@config "../../tailwind.config.ts";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --font-inter: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-noto-urdu: 'Noto Nastaliq Urdu', 'Jameel Noori Nastaleeq', 'Urdu Typesetting', serif;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: #f2f5f3;
+  color: #1e293b;
+  overflow-x: hidden;
+  -webkit-tap-highlight-color: transparent;
+  font-family: var(--font-inter);
+}
+
+/* Claymorphic and Neumorphic Utilities */
+@layer utilities {
+  .clay-card {
+    background: #f8faf9;
+    border-radius: 1.25rem;
+    box-shadow: 
+      8px 8px 18px rgba(163, 177, 170, 0.4),
+      -8px -8px 18px rgba(255, 255, 255, 0.95),
+      inset 2px 2px 3px rgba(255, 255, 255, 0.8),
+      inset -2px -2px 4px rgba(163, 177, 170, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+  }
+
+  .clay-btn-emerald {
+    background: linear-gradient(145deg, #167558, #0f523d);
+    border-radius: 0.875rem;
+    box-shadow: 
+      0 8px 16px -2px rgba(17, 94, 70, 0.35),
+      inset 0 2px 3px rgba(255, 255, 255, 0.35),
+      inset 0 -3px 4px rgba(0, 0, 0, 0.25);
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .clay-btn-emerald:active {
+    transform: translateY(2px) scale(0.98);
+    box-shadow: inset 0 3px 6px rgba(0, 0, 0, 0.4);
+  }
+
+  .neu-input-recessed {
+    background: #ebf0ed;
+    border-radius: 0.75rem;
+    box-shadow: 
+      inset 4px 4px 8px #d5ded9,
+      inset -4px -4px 8px #ffffff;
+  }
+
+  .pressable-clay {
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .pressable-clay:active {
+    transform: scale(0.975);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
 }
