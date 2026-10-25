@@ -13,6 +13,10 @@ export interface ExternalMasjid {
   googleMapsQuery?: string;
 }
 
+// Reject roads, bus stops, or localities named "Masjid" (e.g., "Masjid Banda", "Masjid Bus Stop")
+const NON_MOSQUE_NAME_REGEX =
+  /\b(bus\s*stop|metro|station|banda|road|lane|street|plot|stage|cross|signal|junction)\b/i;
+
 /**
  * Haversine Great-Circle Formula
  * Computes exact geodesic distance in meters between two GPS coordinates
@@ -48,8 +52,28 @@ export function formatDistance(meters: number): string {
 }
 
 /**
+ * Fetch wrapper with AbortController timeout so requests never hang
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 4500
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Default Masjids returned ONLY when User GPS is Disabled / Blocked
- * Uses verified real-world coordinates and explicit Google Maps queries
  */
 export function getDefaultMasjids(): ExternalMasjid[] {
   return [
@@ -70,7 +94,7 @@ export function getDefaultMasjids(): ExternalMasjid[] {
       name: 'Noor Masjid',
       locality: 'Borabanda',
       latitude: 17.4535,
-      longitude: 78.4130,
+      longitude: 78.413,
       distanceMeters: null,
       distanceKm: null,
       formattedBadge: 'Borabanda',
@@ -93,7 +117,8 @@ export function getDefaultMasjids(): ExternalMasjid[] {
 }
 
 /**
- * Provider 1: Fast Indexed Overpass Query (No slow regex scans)
+ * Provider 1: OpenStreetMap Overpass API
+ * Queries ONLY nodes and ways (skips heavy relations) for fast sub-second response
  */
 async function fetchFromOverpass(
   userLat: number,
@@ -101,104 +126,72 @@ async function fetchFromOverpass(
   radiusMeters: number
 ): Promise<ExternalMasjid[]> {
   const query = `
-    [out:json][timeout:8];
+    [out:json][timeout:6];
     (
-      nwr["amenity"="place_of_worship"]["religion"="muslim"](around:${radiusMeters},${userLat},${userLng});
-      nwr["building"="mosque"](around:${radiusMeters},${userLat},${userLng});
+      node["amenity"="place_of_worship"]["religion"="muslim"](around:${radiusMeters},${userLat},${userLng});
+      way["amenity"="place_of_worship"]["religion"="muslim"](around:${radiusMeters},${userLat},${userLng});
+      node["building"="mosque"](around:${radiusMeters},${userLat},${userLng});
+      way["building"="mosque"](around:${radiusMeters},${userLat},${userLng});
     );
     out center tags;
-  `;
+  `.trim();
 
-  const endpoints = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
+  const encoded = encodeURIComponent(query);
+  const mirrors = [
+    `https://overpass-api.de/api/interpreter?data=${encoded}`,
+    `https://overpass.kumi.systems/api/interpreter?data=${encoded}`,
   ];
 
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        body: query,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
-
-      if (!response.ok) continue;
-      const data = await response.json();
-
-      return (data.elements || [])
-        .map((el: any) => {
-          const mLat = el.lat ?? el.center?.lat;
-          const mLng = el.lon ?? el.center?.lon;
-          const rawName = (
-            el.tags?.['name:en'] ||
-            el.tags?.name ||
-            ''
-          ).trim();
-
-          if (!mLat || !mLng || !rawName) return null;
-
-          const distMeters = calculateHaversineMeters(userLat, userLng, mLat, mLng);
-          const locality =
-            el.tags?.['addr:suburb'] ||
-            el.tags?.['addr:neighbourhood'] ||
-            el.tags?.['addr:city'] ||
-            'Nearby';
-
-          return {
-            id: `osm-${el.id}`,
-            name: rawName,
-            locality,
-            latitude: mLat,
-            longitude: mLng,
-            distanceMeters: distMeters,
-            distanceKm: Number((distMeters / 1000).toFixed(2)),
-            formattedBadge: formatDistance(distMeters),
-            isDefault: false,
-          } as ExternalMasjid;
-        })
-        .filter(Boolean) as ExternalMasjid[];
-    } catch {
-      // Try next mirror
-    }
-  }
-
-  return [];
-}
-
-/**
- * Provider 2: Photon Komoot Geosearch API (Ultra-fast proximity search around user GPS)
- */
-async function fetchFromPhoton(
-  userLat: number,
-  userLng: number,
-  radiusMeters: number
-): Promise<ExternalMasjid[]> {
-  try {
-    const url = `https://photon.komoot.io/api/?q=masjid&lat=${userLat}&lon=${userLng}&limit=15`;
-    const response = await fetch(url);
-    if (!response.ok) return [];
-
+  const fetchMirror = async (url: string): Promise<ExternalMasjid[]> => {
+    const response = await fetchWithTimeout(url, {}, 4500);
+    if (!response.ok) throw new Error('Overpass HTTP error');
     const data = await response.json();
-    return (data.features || [])
-      .map((f: any, idx: number) => {
-        const coords = f.geometry?.coordinates; // [lng, lat]
-        const rawName = f.properties?.name?.trim();
-        if (!coords || coords.length < 2 || !rawName) return null;
 
-        const mLng = Number(coords[0]);
-        const mLat = Number(coords[1]);
-        const distMeters = calculateHaversineMeters(userLat, userLng, mLat, mLng);
+    const list = (data.elements || [])
+      .map((el: any) => {
+        const mLat = Number(el.lat ?? el.center?.lat);
+        const mLng = Number(el.lon ?? el.center?.lon);
+        const tags = el.tags || {};
 
+        // Exclude non-mosque infrastructure
+        if (tags.highway || tags.public_transport || tags.place || tags.shop) {
+          return null;
+        }
+
+        const rawName = (
+          tags['name:en'] ||
+          tags.name ||
+          tags.official_name ||
+          tags.alt_name ||
+          ''
+        ).trim();
+
+        if (
+          !Number.isFinite(mLat) ||
+          !Number.isFinite(mLng) ||
+          !rawName ||
+          NON_MOSQUE_NAME_REGEX.test(rawName)
+        ) {
+          return null;
+        }
+
+        const distMeters = calculateHaversineMeters(
+          userLat,
+          userLng,
+          mLat,
+          mLng
+        );
         if (distMeters > radiusMeters) return null;
 
         const locality =
-          f.properties?.district ||
-          f.properties?.locality ||
-          f.properties?.city ||
-          'Nearby';
+          tags['addr:suburb'] ||
+          tags['addr:neighbourhood'] ||
+          tags['addr:locality'] ||
+          tags['addr:city'] ||
+          'Hyderabad';
 
         return {
-          id: `photon-${f.properties?.osm_id || idx}`,
+          id: `osm-${el.id}`,
           name: rawName,
           locality,
           latitude: mLat,
@@ -207,6 +200,114 @@ async function fetchFromPhoton(
           distanceKm: Number((distMeters / 1000).toFixed(2)),
           formattedBadge: formatDistance(distMeters),
           isDefault: false,
+          googleMapsQuery: `${rawName}, ${locality}`,
+        } as ExternalMasjid;
+      })
+      .filter(Boolean) as ExternalMasjid[];
+
+    if (list.length === 0) throw new Error('Empty Overpass list');
+    return list;
+  };
+
+  try {
+    return await Promise.any(mirrors.map((url) => fetchMirror(url)));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Provider 2: Bounded Photon Geosearch API
+ * Uses a strict &bbox= parameter around the user's GPS and filters for worship/mosque POIs
+ */
+async function fetchFromPhotonBounded(
+  userLat: number,
+  userLng: number,
+  radiusMeters: number
+): Promise<ExternalMasjid[]> {
+  try {
+    // 0.045 degrees is ~5km around user's coordinates
+    const delta = 0.045;
+    const bbox = `${userLng - delta},${userLat - delta},${userLng + delta},${userLat + delta}`;
+
+    const urls = [
+      `https://photon.komoot.io/api/?q=masjid&lat=${userLat}&lon=${userLng}&bbox=${bbox}&limit=25`,
+      `https://photon.komoot.io/api/?q=mosque&lat=${userLat}&lon=${userLng}&bbox=${bbox}&limit=25`,
+    ];
+
+    const settled = await Promise.allSettled(
+      urls.map((u) => fetchWithTimeout(u, {}, 3500).then((r) => r.json()))
+    );
+
+    const features: any[] = [];
+    for (const res of settled) {
+      if (res.status === 'fulfilled' && Array.isArray(res.value?.features)) {
+        features.push(...res.value.features);
+      }
+    }
+
+    return features
+      .map((f: any, idx: number) => {
+        const coords = f.geometry?.coordinates; // [lng, lat]
+        const props = f.properties || {};
+        const rawName = (props.name || '').trim();
+
+        if (!coords || coords.length < 2 || !rawName) return null;
+
+        // Strictly reject roads, bus stops, suburbs, and shops
+        const osmKey = (props.osm_key || '').toLowerCase();
+        const osmValue = (props.osm_value || '').toLowerCase();
+
+        if (
+          osmKey === 'highway' ||
+          osmKey === 'place' ||
+          osmKey === 'shop' ||
+          osmKey === 'landuse' ||
+          osmKey === 'public_transport' ||
+          NON_MOSQUE_NAME_REGEX.test(rawName)
+        ) {
+          return null;
+        }
+
+        // Must be a place_of_worship, mosque building, or explicitly named Masjid/Mosque
+        const isWorshipTag =
+          osmValue === 'place_of_worship' ||
+          osmValue === 'mosque' ||
+          osmKey === 'amenity' ||
+          osmKey === 'building';
+
+        if (!isWorshipTag) return null;
+
+        const mLng = Number(coords[0]);
+        const mLat = Number(coords[1]);
+        if (!Number.isFinite(mLat) || !Number.isFinite(mLng)) return null;
+
+        const distMeters = calculateHaversineMeters(
+          userLat,
+          userLng,
+          mLat,
+          mLng
+        );
+        if (distMeters > radiusMeters) return null;
+
+        const locality =
+          props.district ||
+          props.locality ||
+          props.suburb ||
+          props.city ||
+          'Hyderabad';
+
+        return {
+          id: `photon-${props.osm_id || idx}`,
+          name: rawName,
+          locality,
+          latitude: mLat,
+          longitude: mLng,
+          distanceMeters: distMeters,
+          distanceKm: Number((distMeters / 1000).toFixed(2)),
+          formattedBadge: formatDistance(distMeters),
+          isDefault: false,
+          googleMapsQuery: `${rawName}, ${locality}`,
         } as ExternalMasjid;
       })
       .filter(Boolean) as ExternalMasjid[];
@@ -216,30 +317,42 @@ async function fetchFromPhoton(
 }
 
 /**
- * Finds the K-Nearest Real Masjids around the user's live GPS location
+ * K-Nearest Neighbor (KNN) Algorithm for Real Nearby Masjids
+ * 1. Queries Overpass + Bounded Photon around (userLat, userLng)
+ * 2. Computes exact Haversine distance d(user, masjid_i)
+ * 3. Sorts ascending and deduplicates within 50m to return the top K closest masjids
  */
 export async function findKNearestMasjids(
   userLat: number,
   userLng: number,
-  radiusMeters = 4500,
+  radiusMeters = 5000,
   k = 3
 ): Promise<ExternalMasjid[]> {
-  const [overpassResults, photonResults] = await Promise.all([
+  if (!Number.isFinite(userLat) || !Number.isFinite(userLng)) {
+    return [];
+  }
+
+  const settled = await Promise.allSettled([
     fetchFromOverpass(userLat, userLng, radiusMeters),
-    fetchFromPhoton(userLat, userLng, radiusMeters),
+    fetchFromPhotonBounded(userLat, userLng, radiusMeters),
   ]);
 
-  const combined = [...overpassResults, ...photonResults];
+  const candidates: ExternalMasjid[] = [];
+  for (const res of settled) {
+    if (res.status === 'fulfilled' && Array.isArray(res.value)) {
+      candidates.push(...res.value);
+    }
+  }
 
-  // Sort strictly by shortest Haversine distance from user GPS
-  combined.sort(
+  // Sort strictly by shortest Haversine distance from user's GPS
+  candidates.sort(
     (a, b) => (a.distanceMeters ?? 999999) - (b.distanceMeters ?? 999999)
   );
 
-  // Deduplicate masjids that share the same name or are within 45 meters of each other
-  const uniqueMasjids: ExternalMasjid[] = [];
-  for (const candidate of combined) {
-    const isDuplicate = uniqueMasjids.some((existing) => {
+  // Deduplicate identical names or nodes within 50 meters of each other
+  const kNearest: ExternalMasjid[] = [];
+  for (const candidate of candidates) {
+    const isDuplicate = kNearest.some((existing) => {
       const sameName =
         existing.name.toLowerCase() === candidate.name.toLowerCase();
       const proximity = calculateHaversineMeters(
@@ -248,53 +361,59 @@ export async function findKNearestMasjids(
         candidate.latitude,
         candidate.longitude
       );
-      return sameName || proximity < 45;
+      return sameName || proximity < 50;
     });
 
     if (!isDuplicate) {
-      uniqueMasjids.push(candidate);
+      kNearest.push(candidate);
     }
-    if (uniqueMasjids.length >= k) break;
+    if (kNearest.length >= k) break;
   }
 
-  return uniqueMasjids;
+  return kNearest;
 }
 
 /**
- * Generates an accurate Google Maps Directions URL:
- * - When GPS is enabled: Routes from user's exact GPS coordinates to the nearest masjid's real coordinates
- * - When GPS is disabled: Routes to the verified Default Masjid place query
+ * Builds the exact Google Maps Directions URL from the user's location
+ * to the K-Nearest Masjid's verified coordinates
  */
 export function buildMasjidDirectionsUrl(
   userCoords: Coordinates | null,
   masjid: ExternalMasjid | null
 ): string {
-  // Case 1: GPS Enabled + Real Nearest Masjid Selected
-  if (userCoords && masjid && !masjid.isDefault) {
+  // Case 1: GPS Enabled + Real KNN Masjid Selected -> Pin-to-Pin from User GPS to Nearest Masjid GPS
+  if (
+    userCoords &&
+    masjid &&
+    !masjid.isDefault &&
+    Number.isFinite(masjid.latitude) &&
+    Number.isFinite(masjid.longitude)
+  ) {
     return `https://www.google.com/maps/dir/?api=1&origin=${userCoords.latitude},${userCoords.longitude}&destination=${masjid.latitude},${masjid.longitude}&travelmode=walking`;
   }
 
-  // Case 2: GPS Enabled, but no specific OSM node was found -> Route to closest "Masjid" from user's GPS
-  if (userCoords && !masjid) {
-    return `https://www.google.com/maps/dir/?api=1&origin=${userCoords.latitude},${userCoords.longitude}&destination=Masjid&travelmode=walking`;
-  }
-
-  // Case 3: GPS Disabled + Default Masjid Selected
-  if (masjid) {
+  // Case 2: GPS Disabled + Default Masjid Selected -> Route to verified Masjid query
+  if (masjid && masjid.isDefault) {
     const query =
       masjid.googleMapsQuery ||
       `${masjid.name}, ${masjid.locality}, Hyderabad`;
     return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(query)}&travelmode=walking`;
   }
 
-  // Fallback general search
+  // Case 3: GPS Enabled, fallback if no OSM node returned
+  if (userCoords) {
+    return `https://www.google.com/maps/search/Masjid/@${userCoords.latitude},${userCoords.longitude},16z`;
+  }
+
   return 'https://www.google.com/maps/search/Masjid+near+me';
 }
 
 /**
- * Opens Google Maps showing all nearby masjids around user's GPS (or general search if GPS off)
+ * Opens Google Maps showing all nearby masjids centered on user's GPS
  */
-export function buildLiveNearbyMasjidsUrl(userCoords: Coordinates | null): string {
+export function buildLiveNearbyMasjidsUrl(
+  userCoords: Coordinates | null
+): string {
   if (userCoords) {
     return `https://www.google.com/maps/search/Masjid/@${userCoords.latitude},${userCoords.longitude},16z`;
   }

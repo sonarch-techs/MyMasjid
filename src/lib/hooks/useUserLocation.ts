@@ -13,6 +13,7 @@ export interface UserLocationState {
   loading: boolean;
   error: string | null;
   isGpsEnabled: boolean;
+  permissionStatus: PermissionState | 'unknown';
   requestPermission: () => void;
 }
 
@@ -21,6 +22,7 @@ export function useUserLocation(): UserLocationState {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
+  const [permissionStatus, setPermissionStatus] = useState<PermissionState | 'unknown'>('unknown');
 
   const requestPermission = useCallback(() => {
     if (typeof window === 'undefined' || !navigator.geolocation) {
@@ -46,7 +48,6 @@ export function useUserLocation(): UserLocationState {
     };
 
     const handleFinalFailure = (err: GeolocationPositionError) => {
-      // Do NOT inject fake fallback coordinates when GPS is disabled/unavailable
       setCoords(null);
       setIsGpsEnabled(false);
       setError(err.message || 'Location access disabled');
@@ -59,11 +60,12 @@ export function useUserLocation(): UserLocationState {
       (err) => {
         // If user explicitly denied permission (code 1), stop immediately
         if (err.code === 1) {
+          setPermissionStatus('denied');
           handleFinalFailure(err);
           return;
         }
 
-        // Stage 2: If satellite GPS timed out indoors/on desktop, fallback to Wi-Fi/Network triangulation
+        // Stage 2: Fallback to Network Triangulation if satellite GPS timed out indoors
         navigator.geolocation.getCurrentPosition(
           handleSuccess,
           handleFinalFailure,
@@ -76,8 +78,8 @@ export function useUserLocation(): UserLocationState {
       },
       {
         enableHighAccuracy: true,
-        timeout: 6000,
-        maximumAge: 30000,
+        timeout: 8000,
+        maximumAge: 0,
       }
     );
   }, []);
@@ -85,16 +87,22 @@ export function useUserLocation(): UserLocationState {
   useEffect(() => {
     requestPermission();
 
-    // Automatically react if the user toggles browser location permission
+    // Listen for live changes to browser location permissions
     if (typeof navigator !== 'undefined' && navigator.permissions) {
       navigator.permissions
         .query({ name: 'geolocation' as PermissionName })
         .then((status) => {
+          setPermissionStatus(status.state);
+          
           status.onchange = () => {
-            requestPermission();
+            setPermissionStatus(status.state);
+            // If user goes to settings and switches to 'granted', auto-fetch GPS!
+            if (status.state === 'granted') {
+              requestPermission();
+            }
           };
         })
-        .catch(() => {});
+        .catch(() => setPermissionStatus('unknown'));
     }
   }, [requestPermission]);
 
@@ -103,6 +111,7 @@ export function useUserLocation(): UserLocationState {
     loading,
     error,
     isGpsEnabled,
+    permissionStatus,
     requestPermission,
   };
 }
