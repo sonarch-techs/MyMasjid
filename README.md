@@ -1,5 +1,5 @@
 #My Masjid Web app 
-* **You can visit the website: https://mymasjids.vercel.app
+* **You can visit the website: https://my-masjids.vercel.app
 
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
